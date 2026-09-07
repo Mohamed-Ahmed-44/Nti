@@ -1,0 +1,340 @@
+//Dual-Port RAM
+
+module fifo_mem #(
+    parameter DATA_WIDTH = 8,
+    parameter ADDR_WIDTH = 3
+)(  
+    input wire wclk,
+    input wire w_en,
+    input wire full,
+    input wire [ADDR_WIDTH-1:0] b_wptr,
+    input wire [ADDR_WIDTH-1:0] b_rptr,
+    input wire [DATA_WIDTH-1:0] data_in,
+    output wire [DATA_WIDTH-1:0] data_out
+);
+
+reg [DATA_WIDTH-1:0] mem [0:(1<<ADDR_WIDTH)-1];
+
+always @(posedge wclk) begin
+       if (w_en && !full) begin
+            mem[b_wptr] <= data_in;
+       end
+end
+// Asynchronous read 
+assign data_out = mem[b_rptr];
+endmodule
+
+//-------------------------------------------
+
+//Write Pointer Handler
+module wptr_handler #(
+    parameter ADDR_WIDTH = 3
+)(
+    input wire wclk,
+    input wire wrst_n,
+    input wire w_en,
+    input wire [ADDR_WIDTH:0] g_rptr_sync,
+    output reg [ADDR_WIDTH:0] b_wptr,
+    output reg [ADDR_WIDTH:0] g_wptr,
+    output reg full
+);
+
+wire [ADDR_WIDTH:0] b_wptr_next, g_wptr_next;
+wire full_val;
+
+assign b_wptr_next = b_wptr + (w_en & ~full);
+
+assign g_wptr_next = (b_wptr_next >> 1) ^ b_wptr_next; // Convert binary to Gray code (Shift right by 1 and XOR)
+
+assign full_val = (g_wptr_next == {~g_rptr_sync[ADDR_WIDTH:ADDR_WIDTH-1], g_rptr_sync[ADDR_WIDTH-2:0]}); // compare to the synchronized read pointer, and the rest match.
+
+always @(posedge wclk or negedge wrst_n) begin
+       if (!wrst_n) begin
+          b_wptr <= 0;
+          g_wptr <= 0;
+          full   <= 1'b0;
+       end else begin
+           b_wptr <= b_wptr_next;
+           g_wptr <= g_wptr_next;
+           full   <= full_val;
+        end
+end
+endmodule
+
+//-------------------------------------------
+
+//Read Pointer Handler
+module rptr_handler #(
+    parameter ADDR_WIDTH = 3
+)(
+    input wire rclk,
+    input wire rrst_n,
+    input wire r_en,
+    input wire [ADDR_WIDTH:0] g_wptr_sync,
+    output reg [ADDR_WIDTH:0] b_rptr,
+    output reg [ADDR_WIDTH:0] g_rptr,
+    output reg empty
+);
+   
+wire [ADDR_WIDTH:0] b_rptr_next, g_rptr_next;
+wire empty_val;
+
+assign b_rptr_next = b_rptr + (r_en & ~empty);
+
+assign g_rptr_next = (b_rptr_next >> 1) ^ b_rptr_next;  // Convert binary to Gray code
+
+assign empty_val = (g_rptr_next == g_wptr_sync); // Empty condition
+
+always @(posedge rclk or negedge rrst_n) begin
+        if (!rrst_n) begin
+            b_rptr <= 0;
+            g_rptr <= 0;
+            empty  <= 1'b1; // FIFO is empty on reset
+        end else begin
+            b_rptr <= b_rptr_next;
+            g_rptr <= g_rptr_next;
+            empty  <= empty_val;
+        end
+end
+endmodule      
+
+
+//The Synchronizers
+module sync_ptr #(
+    parameter ADDR_WIDTH = 3
+)(
+    input wire clk,
+    input wire rst_n,
+    input wire [ADDR_WIDTH:0] ptr_in,
+    output reg [ADDR_WIDTH:0] ptr_out
+);
+    // Two internal registers for the 2-stage synchronizer
+reg [ADDR_WIDTH:0] q1;
+
+always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            q1      <= 0;
+            ptr_out <= 0;
+        end else begin
+            q1      <= ptr_in;
+            ptr_out <= q1;
+        end
+    end
+endmodule
+
+module async_fifo #(
+    parameter DATA_WIDTH = 8,
+    parameter ADDR_WIDTH = 3  
+)(
+// Write Domain
+    input wire wclk,
+    input wire wrst_n,       
+    input wire w_en,
+    input wire [DATA_WIDTH-1:0] data_in,
+    output wire full,
+
+// Read Domain
+    input wire rclk,
+    input wire rrst_n,       // Active-low read reset
+    input wire r_en,
+    output wire [DATA_WIDTH-1:0] data_out,
+    output wire empty
+);
+
+    
+    wire [ADDR_WIDTH:0] g_wptr, b_wptr, g_wptr_sync;
+    wire [ADDR_WIDTH:0] g_rptr, b_rptr, g_rptr_sync;
+
+    // 1. The FIFO Memory Array
+fifo_mem #(DATA_WIDTH, ADDR_WIDTH) fifo_ram (
+        .wclk(wclk),
+        .w_en(w_en),
+        .full(full),
+        .b_wptr(b_wptr[ADDR_WIDTH-1:0]), 
+        .b_rptr(b_rptr[ADDR_WIDTH-1:0]),
+        .data_in(data_in),
+        .data_out(data_out)
+);
+
+    // 2. Write Pointer Handler
+wptr_handler #(ADDR_WIDTH) wptr_h (
+        .wclk(wclk),
+        .wrst_n(wrst_n),
+        .w_en(w_en),
+        .g_rptr_sync(g_rptr_sync),
+        .b_wptr(b_wptr),
+        .g_wptr(g_wptr),
+        .full(full)
+);
+   // 3. Read Pointer Handler
+rptr_handler #(ADDR_WIDTH) rptr_h (
+        .rclk(rclk),
+        .rrst_n(rrst_n),
+        .r_en(r_en),
+        .g_wptr_sync(g_wptr_sync),
+        .b_rptr(b_rptr),
+        .g_rptr(g_rptr),
+        .empty(empty)
+);
+
+    // 4. Synchronizers (Crossing Clock Domains)
+sync_ptr #(ADDR_WIDTH) sync_r2w (
+        .clk(wclk),
+        .rst_n(wrst_n),
+        .ptr_in(g_rptr),
+        .ptr_out(g_rptr_sync)
+);
+
+    // Synchronize Gray write pointer into Read clock domain
+sync_ptr #(ADDR_WIDTH) sync_w2r (
+        .clk(rclk),
+        .rst_n(rrst_n),
+        .ptr_in(g_wptr),
+        .ptr_out(g_wptr_sync)
+);
+
+endmodule
+
+
+`timescale 1ns / 1ps
+
+module tb_async_fifo();
+
+    parameter DATA_WIDTH = 8;
+    parameter ADDR_WIDTH = 3;
+
+    reg wclk, rclk;
+    reg wrst_n, rrst_n;
+    reg w_en, r_en;
+    reg [DATA_WIDTH-1:0] data_in;
+    
+    wire full, empty;
+    wire [DATA_WIDTH-1:0] data_out;
+
+    // Instantiate the DUT
+async_fifo #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .ADDR_WIDTH(ADDR_WIDTH)
+    ) dut (
+        // Write Domain
+        .wclk(wclk),
+        .wrst_n(wrst_n),
+        .w_en(w_en),
+        .data_in(data_in),
+        .full(full),
+
+        // Read Domain
+        .rclk(rclk),
+        .rrst_n(rrst_n),
+        .r_en(r_en),
+        .data_out(data_out),
+        .empty(empty)
+);
+
+    // ==========================================
+    // CLOCK GENERATION
+    // ==========================================
+    initial wclk = 0;
+    always #10 wclk = ~wclk; // 50 MHz Write Clock
+
+    initial rclk = 0;
+    always #20 rclk = ~rclk; // 25 MHz Read Clock
+
+    // ==========================================
+    // FUNCTIONS (Combinational Math)
+    // ==========================================
+    function [DATA_WIDTH-1:0] calc_next_data(input [DATA_WIDTH-1:0] current, input [DATA_WIDTH-1:0] step);
+        begin
+            calc_next_data = current + step;
+        end
+    endfunction
+
+    // ==========================================
+    // TASKS (Timing & Sequential Logic)
+    // ==========================================
+task system_reset;
+        begin
+            wrst_n = 0;
+            rrst_n = 0;
+            w_en = 0;
+            r_en = 0;
+            data_in = 0;
+            #50;
+            wrst_n = 1;
+            rrst_n = 1;
+            #50; 
+        end
+endtask
+
+task write_burst(input integer num_writes, input [DATA_WIDTH-1:0] start_val);
+        integer i; 
+        reg [DATA_WIDTH-1:0] current_val;
+        begin
+            current_val = start_val;
+            @(negedge wclk);
+            w_en = 1;
+            
+            for (i = 0; i < num_writes; i = i + 1) begin
+                data_in = current_val;
+                current_val = calc_next_data(current_val, 8'h11);
+                @(negedge wclk);
+            end
+            w_en = 0;
+        end
+endtask
+
+task read_burst(input integer num_reads);
+        integer i; 
+        begin
+            @(negedge rclk);
+            r_en = 1;
+            for (i = 0; i < num_reads; i = i + 1) begin
+                @(negedge rclk);
+            end
+            r_en = 0;
+        end
+endtask
+
+    // ==========================================
+    // MAIN TEST SEQUENCE
+    // ==========================================
+    initial begin : MAIN_TEST_BLOCK
+        integer j; // Pre-declare variable for the simultaneous read/write loop
+
+        // 1. System Reset
+        system_reset();
+
+        // 2. Burst Write until full
+        $display("Starting Burst Write...");
+        write_burst(8, 8'h11);
+        #100;
+
+        // 3. Burst Read until empty
+        $display("Starting Burst Read...");
+        read_burst(8);
+        #150;
+
+
+        $display("Starting Simultaneous Read/Write...");
+        @(negedge wclk);
+        w_en = 1;
+        r_en = 1; // Assert both manually
+
+        for (j = 0; j < 10; j = j + 1) begin
+            data_in = calc_next_data(data_in, 8'h05);
+            @(negedge wclk);
+        end
+        
+        w_en = 0; // Stop writing
+        #200;     // Allow read clock to drain data
+        r_en = 0; // Stop reading
+
+        #100;
+        $display("Simulation Complete.");
+        $stop;
+    end
+
+endmodule
+
+
+
